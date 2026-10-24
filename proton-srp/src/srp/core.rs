@@ -1,3 +1,8 @@
+// Modified for crypto-bigint 0.7 (RUSTSEC-2026-0387) by UnicornOps on
+// 2026-10-24: `DynResidue` is now `FixedMontyForm`, randomness comes from
+// rand_core 0.10, and every operation on secrets keeps a constant-time API.
+// Not an official Proton release; see CHANGELOG.md.
+
 //! Implements Proton's core client-side SRP protocol
 //!
 //! This is mostly as described in <https://eprint.iacr.org/2023/1457.pdf>, Fig. 2.
@@ -39,10 +44,10 @@
 //! - The client must show its proof of K first. If the server detects that this
 //!   proof is incorrect it must abort without showing its own proof of K
 
-use crypto_bigint::modular::runtime_mod::{DynResidue, DynResidueParams};
-use crypto_bigint::subtle::ConstantTimeEq;
-use crypto_bigint::{Encoding, Integer, NonZero, RandomMod, Zero, U2048};
-use rand::{CryptoRng, RngCore};
+use crypto_bigint::modular::{FixedMontyForm, FixedMontyParams};
+use crypto_bigint::{NonZero, Odd, RandomMod, U2048};
+use rand::CryptoRng;
+use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
 use crate::pmhash::expand_hash;
@@ -68,6 +73,12 @@ const HARDCODED_GENERATOR: BigUint = BigUint::from_u32(2);
 
 type BigUint = U2048;
 
+/// Integers modulo N in Montgomery form (`DynResidue` in crypto-bigint 0.5).
+type Residue = FixedMontyForm<{ U2048::LIMBS }>;
+
+/// Montgomery parameters for N (`DynResidueParams` in crypto-bigint 0.5).
+type ResidueParams = FixedMontyParams<{ U2048::LIMBS }>;
+
 /// SRP client authentication data containing the group information,
 /// the server reply, and the hashed password.
 #[derive(Debug)]
@@ -76,7 +87,7 @@ pub struct SRPAuthData {
     pub(crate) g: BigUint,
 
     /// Group modulus N
-    pub(crate) n: NonZero<BigUint>,
+    pub(crate) n: Odd<BigUint>,
 
     /// Group modulus minus one N -1.
     pub(crate) n_minus_one: NonZero<BigUint>,
@@ -105,11 +116,11 @@ impl SRPAuthData {
         let g = HARDCODED_GENERATOR;
         // Group modulus N
         let (n, n_minus_one) = extract_and_check_modulus(modulus)?;
-        let params = DynResidueParams::new(&n);
-        let g_residue = DynResidue::new(&g, params);
+        let params = ResidueParams::new(n);
+        let g_residue = Residue::new(&g, &params);
         // Validate modulus N
         // Check that 2^(N-1) % N == 1, N - 1 should be the order
-        if g_residue.pow(&n_minus_one).retrieve() != BigUint::ONE {
+        if g_residue.pow(n_minus_one.as_ref()).retrieve() != BigUint::ONE {
             return Err(SRPError::InvalidModulus(
                 "modulus minus one is not the order of the field",
             ));
@@ -118,7 +129,7 @@ impl SRPAuthData {
         // Validate server_ephemeral Bs
         // Server public ephemeral should not be 0 i.e., B % n != 0
         let b_pub = BigUint::from_le_slice(server_ephemeral);
-        if b_pub.rem(&n).is_zero().into() {
+        if b_pub.rem(n.as_nz_ref()).is_zero().into() {
             return Err(SRPError::InvalidServerEphemeral);
         }
 
@@ -140,7 +151,7 @@ impl SRPAuthData {
 
     pub(crate) fn generate_client_proof<R>(&self, rng: &mut R) -> Result<SRPProof, SRPError>
     where
-        R: CryptoRng + RngCore,
+        R: CryptoRng,
     {
         let g = &self.g;
         let n = &self.n;
@@ -149,12 +160,12 @@ impl SRPAuthData {
 
         // k = H(g || N)
         // The multiplier k must be non zero
-        let Some(k) = NonZero::new(hash_two(g, n).rem(n)).into_option() else {
+        let Some(k) = NonZero::new(hash_two(g, n).rem(n.as_nz_ref())).into_option() else {
             return Err(SRPError::InvalidMultiplier);
         };
 
-        let modulus_param = DynResidueParams::new(n);
-        let g_res = DynResidue::new(g, modulus_param);
+        let modulus_param = ResidueParams::new(*n);
+        let g_res = Residue::new(g, &modulus_param);
 
         let mut rounds = 0;
         let (client_secret, a_pub, u) = loop {
@@ -179,15 +190,15 @@ impl SRPAuthData {
             break (client_secret, a_pub, u);
         };
 
-        let k_residue = DynResidue::new(&k, modulus_param);
+        let k_residue = Residue::new(k.as_ref(), &modulus_param);
 
         // x = hashed_pass = H(H_pw(password, (s || proton)) || N)
         // base = B - kg^x
-        let b_pub_residue = DynResidue::new(b_pub, modulus_param);
+        let b_pub_residue = Residue::new(b_pub, &modulus_param);
         let base = b_pub_residue.sub(&g_res.pow(&self.hashed_pass).mul(&k_residue));
 
         // exponent = (a + ux)
-        let (ux, _) = BigUint::const_rem_wide(self.hashed_pass.mul_wide(&u), &n_minus_one);
+        let ux = BigUint::rem_wide(self.hashed_pass.widening_mul(&u), &n_minus_one);
         let exponent = client_secret.add_mod(&ux, &n_minus_one);
 
         // K = (B - kg^x) ^ (a + ux)
@@ -200,7 +211,7 @@ impl SRPAuthData {
         let server_proof = compute_server_proof(&a_pub, &client_proof, &shared_session);
 
         Ok(SRPProof {
-            client_ephemeral: a_pub.to_le_bytes(),
+            client_ephemeral: a_pub.to_le_bytes().into(),
             client_proof,
             expected_server_proof: server_proof,
         })
@@ -209,7 +220,7 @@ impl SRPAuthData {
     // Helper function to generate or retrieve the client secret
     fn generate_client_secret<R>(&self, rng: &mut R) -> Result<BigUint, SRPError>
     where
-        R: CryptoRng + RngCore,
+        R: CryptoRng,
     {
         #[cfg(test)]
         {
@@ -225,14 +236,14 @@ impl SRPAuthData {
 
 fn extract_and_check_modulus(
     modulus: &[u8; SRP_LEN_BYTES],
-) -> Result<(NonZero<BigUint>, NonZero<BigUint>), SRPError> {
+) -> Result<(Odd<BigUint>, NonZero<BigUint>), SRPError> {
     let n_unchecked = BigUint::from_le_slice(modulus);
     let Some(n) = NonZero::new(n_unchecked).into_option() else {
         return Err(SRPError::InvalidModulus("modulus is zero"));
     };
-    if n.is_even().into() {
+    let Some(n) = Odd::new(*n).into_option() else {
         return Err(SRPError::InvalidModulus("modulus is even"));
-    }
+    };
     if !(n.bit(0).into() && n.bit(1).into() && !bool::from(n.bit(2))) {
         // By quadratic reciprocity, 2 is a square mod N if and only if
         // N is 1 or 7 mod 8. We want the generator, 2, to generate the
@@ -243,7 +254,8 @@ fn extract_and_check_modulus(
         return Err(SRPError::InvalidModulus("modulus did not pass bit check"));
     }
     // We have to unwrap here due to CtOption not exposing the inner value.
-    let Some(n_minus_one) = NonZero::new(n.sub_mod(&BigUint::ONE, &n)).into_option() else {
+    let Some(n_minus_one) = NonZero::new(n.sub_mod(&BigUint::ONE, n.as_nz_ref())).into_option()
+    else {
         return Err(SRPError::InvalidModulus("modulus is invalid"));
     };
     Ok((n, n_minus_one))
@@ -251,8 +263,8 @@ fn extract_and_check_modulus(
 
 fn hash_two(first: &BigUint, second: &BigUint) -> BigUint {
     let mut data_to_hash = [0_u8; 2 * SRP_LEN_BYTES];
-    data_to_hash[..SRP_LEN_BYTES].copy_from_slice(&first.to_le_bytes());
-    data_to_hash[SRP_LEN_BYTES..].copy_from_slice(&second.to_le_bytes());
+    data_to_hash[..SRP_LEN_BYTES].copy_from_slice(first.to_le_bytes().as_slice());
+    data_to_hash[SRP_LEN_BYTES..].copy_from_slice(second.to_le_bytes().as_slice());
     BigUint::from_le_slice(expand_hash(data_to_hash.as_slice()).as_slice())
 }
 
@@ -260,9 +272,10 @@ fn hash_two(first: &BigUint, second: &BigUint) -> BigUint {
 fn compute_client_proof(a_pub: &BigUint, b_pub: &BigUint, shared_session: &BigUint) -> [u8; 256] {
     // client_proof = H (A || B || K)
     let mut data_to_hash = Zeroizing::new([0_u8; 3 * SRP_LEN_BYTES]);
-    data_to_hash[..SRP_LEN_BYTES].copy_from_slice(&a_pub.to_le_bytes());
-    data_to_hash[SRP_LEN_BYTES..(2 * SRP_LEN_BYTES)].copy_from_slice(&b_pub.to_le_bytes());
-    data_to_hash[(2 * SRP_LEN_BYTES)..].copy_from_slice(&shared_session.to_le_bytes());
+    data_to_hash[..SRP_LEN_BYTES].copy_from_slice(a_pub.to_le_bytes().as_slice());
+    data_to_hash[SRP_LEN_BYTES..(2 * SRP_LEN_BYTES)]
+        .copy_from_slice(b_pub.to_le_bytes().as_slice());
+    data_to_hash[(2 * SRP_LEN_BYTES)..].copy_from_slice(shared_session.to_le_bytes().as_slice());
     *expand_hash(data_to_hash.as_slice())
 }
 
@@ -274,9 +287,9 @@ fn compute_server_proof(
 ) -> [u8; 256] {
     // server_proof = H(A || client_proof || K)
     let mut data_to_hash = Zeroizing::new([0_u8; 3 * SRP_LEN_BYTES]);
-    data_to_hash[..SRP_LEN_BYTES].copy_from_slice(&a_pub.to_le_bytes());
+    data_to_hash[..SRP_LEN_BYTES].copy_from_slice(a_pub.to_le_bytes().as_slice());
     data_to_hash[SRP_LEN_BYTES..(2 * SRP_LEN_BYTES)].copy_from_slice(client_proof);
-    data_to_hash[(2 * SRP_LEN_BYTES)..].copy_from_slice(&shared_session.to_le_bytes());
+    data_to_hash[(2 * SRP_LEN_BYTES)..].copy_from_slice(shared_session.to_le_bytes().as_slice());
     *expand_hash(data_to_hash.as_slice())
 }
 
@@ -286,10 +299,13 @@ fn generate_ephemeral_secret<R>(
     rng: &mut R,
 ) -> Result<BigUint, SRPError>
 where
-    R: CryptoRng + RngCore,
+    R: CryptoRng,
 {
     for _ in 0..MAX_RETRIES {
-        let possible_client_item = BigUint::random_mod(rng, &modulus_minus_one);
+        // Rejection sampling: the time depends only on the public modulus and on
+        // rejected draws, never on the accepted value (crypto-bigint 0.7 names
+        // it `_vartime` for that reason; 0.5's `random_mod` sampled the same way).
+        let possible_client_item = BigUint::random_mod_vartime(rng, &modulus_minus_one);
         if possible_client_item > BigUint::ONE {
             return Ok(possible_client_item);
         }
@@ -300,7 +316,7 @@ where
 /// Generates a random srp salt.
 pub(crate) fn generate_random_salt<R>(rng: &mut R) -> Vec<u8>
 where
-    R: CryptoRng + RngCore,
+    R: CryptoRng,
 {
     let mut salt_bytes: Vec<u8> = vec![0; SALT_LEN_BYTES];
     rng.fill_bytes(&mut salt_bytes);
@@ -319,8 +335,8 @@ pub(crate) fn generate_srp_verifier(
     let g = HARDCODED_GENERATOR;
     // Group modulus N
     let (n, _) = extract_and_check_modulus(modulus_bytes)?;
-    let modulus_param = DynResidueParams::new(&n);
-    let g_res = DynResidue::new(&g, modulus_param);
+    let modulus_param = ResidueParams::new(n);
+    let g_res = Residue::new(&g, &modulus_param);
 
     // hashed_pass x = H(H_pw(password || s) || N)
     let hashed_pass = BigUint::from_le_slice(
@@ -328,7 +344,7 @@ pub(crate) fn generate_srp_verifier(
     );
     // verifier = g^x
     let verifier = g_res.pow(&hashed_pass).retrieve();
-    let verifier_bytes: [u8; SRP_LEN_BYTES] = verifier.to_le_bytes();
+    let verifier_bytes: [u8; SRP_LEN_BYTES] = verifier.to_le_bytes().into();
 
     Ok(SRPVerifier {
         version,
@@ -343,7 +359,7 @@ pub struct ServerInteraction {
     pub(crate) g: BigUint,
 
     /// Group modulus N
-    pub(crate) n: NonZero<BigUint>,
+    pub(crate) n: Odd<BigUint>,
 
     /// Group modulus N - 1
     pub(crate) n_minus_one: NonZero<BigUint>,
@@ -371,14 +387,14 @@ impl ServerInteraction {
         rng: &mut R,
     ) -> Result<Self, SRPError>
     where
-        R: CryptoRng + RngCore,
+        R: CryptoRng,
     {
         // Generator g is hardcoded to 2
         let g = HARDCODED_GENERATOR;
         // Group modulus N
         let (n, n_minus_one) = extract_and_check_modulus(modulus)?;
         // k
-        let Some(k) = NonZero::new(hash_two(&g, &n).rem(&n)).into_option() else {
+        let Some(k) = NonZero::new(hash_two(&g, &n).rem(n.as_nz_ref())).into_option() else {
             return Err(SRPError::InvalidMultiplier);
         };
         // b
@@ -409,7 +425,7 @@ impl ServerInteraction {
         // Group modulus N
         let (n, n_minus_one) = extract_and_check_modulus(modulus)?;
         // k
-        let Some(k) = NonZero::new(hash_two(&g, &n).rem(&n)).into_option() else {
+        let Some(k) = NonZero::new(hash_two(&g, &n).rem(n.as_nz_ref())).into_option() else {
             return Err(SRPError::InvalidMultiplier);
         };
 
@@ -434,18 +450,18 @@ impl ServerInteraction {
     }
 
     pub(crate) fn generate_challenge(&mut self) -> [u8; SRP_LEN_BYTES] {
-        let params = DynResidueParams::new(&self.n);
+        let params = ResidueParams::new(self.n);
 
-        let g_residue = DynResidue::new(&self.g, params);
-        let k_residue = DynResidue::new(&self.k, params);
-        let v_residue = DynResidue::new(&self.v, params);
+        let g_residue = Residue::new(&self.g, &params);
+        let k_residue = Residue::new(self.k.as_ref(), &params);
+        let v_residue = Residue::new(&self.v, &params);
 
         // g^b
         let ephemeral_part = g_residue.pow(&self.b);
 
         // B = k*v + g^b
         let b_pub = ephemeral_part.add(&k_residue.mul(&v_residue)).retrieve();
-        let server_ephemeral_encoded = b_pub.to_le_bytes();
+        let server_ephemeral_encoded = b_pub.to_le_bytes().into();
         self.server_ephemeral = Some(b_pub);
 
         server_ephemeral_encoded
@@ -463,7 +479,8 @@ impl ServerInteraction {
 
         // A
         let Some(client_ephemeral_num) =
-            NonZero::new(BigUint::from_le_slice(client_ephemeral).rem(&self.n)).into_option()
+            NonZero::new(BigUint::from_le_slice(client_ephemeral).rem(self.n.as_nz_ref()))
+                .into_option()
         else {
             return Err(SRPError::InvalidClientEphemeral);
         };
@@ -476,15 +493,15 @@ impl ServerInteraction {
             return Err(SRPError::InvalidScramblingParameter);
         };
 
-        let params = DynResidueParams::new(&self.n);
+        let params = ResidueParams::new(self.n);
         // v
-        let v_residue = DynResidue::new(&self.v, params);
+        let v_residue = Residue::new(&self.v, &params);
         // A
-        let client_ephemeral_residue = DynResidue::new(&client_ephemeral_num, params);
+        let client_ephemeral_residue = Residue::new(client_ephemeral_num.as_ref(), &params);
 
         // K = (Av^u) ^ b
         let shared_session = v_residue
-            .pow(&u)
+            .pow(u.as_ref())
             .mul(&client_ephemeral_residue)
             .pow(&self.b)
             .retrieve();
@@ -508,10 +525,10 @@ impl ServerInteraction {
 
     pub(crate) fn server_ephemeral(&self) -> Option<[u8; SRP_LEN_BYTES]> {
         self.server_ephemeral
-            .map(|ephemeral| ephemeral.to_le_bytes())
+            .map(|ephemeral| ephemeral.to_le_bytes().into())
     }
 
     pub(crate) fn server_ephemeral_secret(&self) -> Zeroizing<[u8; SRP_LEN_BYTES]> {
-        Zeroizing::new(self.b.to_le_bytes())
+        Zeroizing::new(self.b.to_le_bytes().into())
     }
 }

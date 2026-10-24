@@ -1,6 +1,6 @@
 use base64::{prelude::BASE64_STANDARD as BASE_64, Engine as _};
-use crypto_bigint::subtle::ConstantTimeEq;
-use rand::{CryptoRng, RngCore};
+use rand::CryptoRng;
+use subtle::ConstantTimeEq;
 
 use crate::{srp_default_csprng, ModulusSignatureVerifier, SRPError, SrpHashVersion};
 
@@ -206,7 +206,7 @@ impl SRPAuth {
     #[cfg(feature = "custom_csprng")]
     pub fn generate_proofs_with_rng<Rand>(&self, rng: &mut Rand) -> Result<SRPProof, SRPError>
     where
-        Rand: CryptoRng + RngCore,
+        Rand: CryptoRng,
     {
         self.0.generate_client_proof(rng)
     }
@@ -268,7 +268,7 @@ impl SRPAuth {
         rng: &mut Rand,
     ) -> Result<SRPVerifier, SRPError>
     where
-        Rand: CryptoRng + RngCore,
+        Rand: CryptoRng,
     {
         Self::inner_generate_verifier_with_rng(modulus_verifier, password, salt_opt, modulus, rng)
     }
@@ -350,7 +350,7 @@ impl SRPAuth {
         rng: &mut Rand,
     ) -> Result<SRPVerifier, SRPError>
     where
-        Rand: CryptoRng + RngCore,
+        Rand: CryptoRng,
     {
         let modulus_b64 = modulus_verifier.verify_and_extract_modulus(
             modulus,

@@ -9,9 +9,11 @@ authors.workspace = true
 [dependencies]
 bcrypt = "0.17.1"
 md5 = { package = "md-5", version = "0.10.6" }
-crypto-bigint = { version = "0.5.5", features = ["zeroize"] }
+# Modified for crypto-bigint 0.7 (RUSTSEC-2026-0387); was 0.5.5 with rand 0.8.
+crypto-bigint = { version = "0.7.6", default-features = false, features = ["rand_core", "zeroize"] }
 hex = { workspace = true }
-rand = { workspace = true }
+rand = "0.10"
+subtle = "2.6"
 sha2 = { workspace = true }
 base64 = { workspace = true }
 thiserror = { workspace = true }

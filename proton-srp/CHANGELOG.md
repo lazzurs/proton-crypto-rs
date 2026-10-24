@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2024-00-00
 
+### Changed (lazzurs fork, branch `zmail/crypto-bigint-0.7`)
+- Modified for crypto-bigint 0.7 (RUSTSEC-2026-0387): moved from
+  crypto-bigint 0.5.5 to 0.7.6 (`FixedMontyForm`/`FixedMontyParams` replace
+  `DynResidue`/`DynResidueParams`) and from rand 0.8 to rand 0.10, so the
+  `custom_csprng` functions now take a rand_core 0.10 `CryptoRng`. Proof
+  computation and the test vectors are unchanged. Needs Rust 1.87
+  (crypto-bigint 0.7.6's MSRV). Not an official Proton release.
+
 ## 0.8.4 - 2026-10-05
 
 ### Changed
